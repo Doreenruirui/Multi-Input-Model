@@ -23,12 +23,18 @@ import random
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
+from tensorflow.python.framework import ops
 from tensorflow.python.framework import dtypes
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import embedding_ops
 from tensorflow.python.ops import rnn
 from tensorflow.python.ops import rnn_cell
 from tensorflow.python.ops import variable_scope as vs
+from tensorflow.python.ops.math_ops import sigmoid
 from tensorflow.python.ops.math_ops import tanh
+
+
 
 PAD_ID = 0
 SOS_ID = 1
@@ -44,10 +50,8 @@ def get_optimizer(opt):
         assert(False)
     return optfn
 
-
 class GRUCellAttn(rnn_cell.GRUCell):
     def __init__(self, num_units, encoder_output, scope=None):
-        #[seq_len, num_wit, batch_size, num_units]
         self.hs = encoder_output
         with vs.variable_scope(scope or type(self).__name__):
             with vs.variable_scope("Attn1"):
@@ -57,32 +61,28 @@ class GRUCellAttn(rnn_cell.GRUCell):
         super(GRUCellAttn, self).__init__(num_units)
 
     def __call__(self, inputs, state, scope=None):
-        #[batch_size, num_units]
         gru_out, gru_state = super(GRUCellAttn, self).__call__(inputs, state, scope)
         with vs.variable_scope(scope or type(self).__name__):
             with vs.variable_scope("Attn2"):
-                #[seq_len, num_wit, batch_size, num_units]
                 gamma_h = tanh(rnn_cell._linear(gru_out, self._num_units, True, 1.0))
-            weights = tf.reduce_sum(self.phi_hs * gamma_h, reduction_indices=3, keep_dims=True)
+            weights = tf.reduce_sum(self.phi_hs * gamma_h, reduction_indices=2, keep_dims=True)
             weights = tf.exp(weights - tf.reduce_max(weights, reduction_indices=0, keep_dims=True))
             weights = weights / (1e-6 + tf.reduce_sum(weights, reduction_indices=0, keep_dims=True))
-            # [num_wit, batch_size, num_units]
             context = tf.reduce_sum(self.hs * weights, reduction_indices=0)
-            # [batch_size, num_units]
-            first_context = tf.reshape(tf.slice(context, [0, 0, 0],[1, -1, -1]), [-1, self._num_units])
-            # [batch_size, num_units]
-            context = tf.reshape(tf.reduce_mean(context, reduction_indices=0), [-1, self._num_units])
             with vs.variable_scope("AttnConcat"):
-                out = tf.nn.relu(rnn_cell._linear([first_context, context, gru_out], self._num_units, True, 1.0))
+                out = tf.nn.relu(rnn_cell._linear([context, gru_out], self._num_units, True, 1.0))
+            self.attn_map = tf.squeeze(tf.slice(weights, [0, 0, 0], [-1, -1, 1]))
             return (out, out)
 
 
 class NLCModel(object):
-    def __init__(self, vocab_size, embed_size, size, num_layers, max_gradient_norm, learning_rate,
+    def __init__(self, vocab_size, embed_size, size, num_layers, max_gradient_norm, batch_size, learning_rate,
                  learning_rate_decay_factor, dropout, forward_only=False, optimizer="adam"):
-        self.embed_size = embed_size
+
         self.size = size
+        self.embed_size = embed_size
         self.vocab_size = vocab_size
+        self.batch_size = batch_size
         self.num_layers = num_layers
         self.keep_prob_config = 1.0 - dropout
         self.learning_rate = tf.Variable(float(learning_rate), trainable=False)
@@ -90,20 +90,15 @@ class NLCModel(object):
         self.global_step = tf.Variable(0, trainable=False)
 
         self.keep_prob = tf.placeholder(tf.float32)
-        self.source_tokens = tf.placeholder(tf.int32, shape=[None, None, None])
+        self.source_tokens = tf.placeholder(tf.int32, shape=[None, None])
         self.target_tokens = tf.placeholder(tf.int32, shape=[None, None])
-        self.source_mask = tf.placeholder(tf.int32, shape=[None, None, None])
+        self.source_mask = tf.placeholder(tf.int32, shape=[None, None])
         self.target_mask = tf.placeholder(tf.int32, shape=[None, None])
         self.beam_size = tf.placeholder(tf.int32)
         self.target_length = tf.reduce_sum(self.target_mask, reduction_indices=0)
         self.len_input = tf.placeholder(tf.int32)
 
-        self.seq_len = tf.shape(self.source_tokens)[0]
-        self.num_wit = tf.shape(self.source_tokens)[1]
-        self.batch_size = tf.shape(self.source_tokens)[2]
-
         self.decoder_state_input, self.decoder_state_output = [], []
-
         for i in xrange(num_layers):
             self.decoder_state_input.append(tf.placeholder(tf.float32, shape=[None, size]))
 
@@ -126,10 +121,11 @@ class NLCModel(object):
         self.saver = tf.train.Saver(tf.all_variables(), max_to_keep=0)
 
 
+
     def setup_embeddings(self):
         with vs.variable_scope("embeddings"):
-            self.L_enc = tf.get_variable("L_enc", [self.vocab_size, self.size])
-            self.L_dec = tf.get_variable("L_dec", [self.vocab_size, self.size])
+            self.L_enc = tf.get_variable("L_enc", [self.vocab_size, self.embed_size])
+            self.L_dec = tf.get_variable("L_dec", [self.vocab_size, self.embed_size])
             self.encoder_inputs = embedding_ops.embedding_lookup(self.L_enc, self.source_tokens)
             self.decoder_inputs = embedding_ops.embedding_lookup(self.L_dec, self.target_tokens)
 
@@ -137,8 +133,8 @@ class NLCModel(object):
     def setup_encoder(self):
         self.encoder_cell = rnn_cell.GRUCell(self.size)
         with vs.variable_scope("PryamidEncoder"):
-            inp = tf.reshape(self.encoder_inputs, [self.seq_len, -1, self.embed_size])
-            mask = tf.reshape(self.source_mask, [self.seq_len, -1])
+            inp = self.encoder_inputs
+            mask = self.source_mask
             out = None
             for i in xrange(self.num_layers):
                 with vs.variable_scope("EncoderCell%d" % i) as scope:
@@ -146,8 +142,7 @@ class NLCModel(object):
                     out, _ = self.bidirectional_rnn(self.encoder_cell, inp, srclen, scope=scope)
                     dropin, mask = self.downscale(out, mask)
                     inp = self.dropout(dropin)
-            self.encoder_output = tf.reshape(out, [self.seq_len, self.num_wit, self.batch_size, -1])
-
+            self.encoder_output = out
 
     def setup_decoder(self):
         if self.num_layers > 1:
@@ -177,11 +172,11 @@ class NLCModel(object):
 
         with vs.variable_scope("Decoder", reuse=True):
             for i in xrange(self.num_layers - 1):
-                with vs.variable_scope("DecoderCell%d" % i):
+                with vs.variable_scope("DecoderCell%d" % i) as scope:
                     inp, state_output = self.decoder_cell(inp, decoder_state_input[i])
                     decoder_state_output.append(state_output)
 
-            with vs.variable_scope("DecoderAttnCell"):
+            with vs.variable_scope("DecoderAttnCell") as scope:
                 decoder_output, state_output = self.attn_cell(inp, decoder_state_input[i+1])
                 decoder_state_output.append(state_output)
 
@@ -198,6 +193,7 @@ class NLCModel(object):
 
         state_0 = tf.zeros([1, self.size])
         states_0 = [state_0] * self.num_layers
+
 
         def beam_cond(cand_probs, cand_seqs, time, beam_probs, beam_seqs, cand_seq_prob, beam_seq_prob, *states):
             return tf.logical_and(tf.reduce_max(beam_probs) >= tf.reduce_min(cand_probs), time < tf.reshape(self.len_input, ()) + 10)
@@ -242,9 +238,8 @@ class NLCModel(object):
             new_cand_probs = tf.select(tf.greater(self.len_input - 10, new_cand_len),
                                        tf.ones_like(new_cand_probs) * -3e38,
                                        new_cand_probs)
-            new_cand_probs =  tf.select(tf.greater(new_cand_len, self.len_input + 10),
-                                        tf.ones_like(new_cand_probs) * -3e38,
-                                        new_cand_probs)
+
+
             cand_k = tf.minimum(tf.size(new_cand_probs), self.beam_size)
             next_cand_probs, next_cand_indices = tf.nn.top_k(new_cand_probs, k=cand_k)
             next_cand_seqs = tf.gather(new_cand_seqs, next_cand_indices)
@@ -264,8 +259,14 @@ class NLCModel(object):
             return [next_cand_probs, next_cand_seqs, time + 1, next_beam_probs, next_beam_seqs, next_cand_seq_prob, next_beam_seq_prob] + next_states
 
         var_shape = []
+        # var_shape.append((total_probs_0, tf.TensorShape([None, None])))
+        # var_shape.append((eos_probs_0, tf.TensorShape([None, None])))
         var_shape.append((cand_probs_0, tf.TensorShape([None,])))
         var_shape.append((cand_seqs_0, tf.TensorShape([None, None])))
+        # var_shape.append((cur_probs_0, tf.TensorShape([None, None])))
+        # var_shape.append((cur_eos_probs_0, tf.TensorShape([None, None])))
+        # var_shape.append((bases_0, tf.TensorShape([None, None])))
+        # var_shape.append((mods_0, tf.TensorShape([None, None])))
         var_shape.append((time_0, time_0.get_shape()))
         var_shape.append((beam_probs_0, tf.TensorShape([None,])))
         var_shape.append((beam_seqs_0, tf.TensorShape([None, None])))
@@ -414,7 +415,7 @@ class NLCModel(object):
 
     def decode_beam(self, session, encoder_output, beam_size, len_input):
         input_feed = {}
-        input_feed[self.encoder_output_feed] = encoder_output
+        input_feed[self.encoder_output] = encoder_output
         input_feed[self.keep_prob] = 1.
         input_feed[self.beam_size] = beam_size
         input_feed[self.len_input] = len_input

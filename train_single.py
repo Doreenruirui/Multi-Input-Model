@@ -30,18 +30,16 @@ import numpy as np
 from six.moves import xrange
 import tensorflow as tf
 
-import nlc_model_multiple as nlc_model
+import nlc_model_single as nlc_model
 from flag import FLAGS
-from util import pair_iter, initialize_vocabulary
-import util
+from util_single import pair_iter, initialize_vocabulary
 
 import logging
 logging.basicConfig(level=logging.INFO)
 
-
 def create_model(session, vocab_size, forward_only):
     model = nlc_model.NLCModel(
-        vocab_size, FLAGS.embed_size, FLAGS.size, FLAGS.num_layers, FLAGS.max_gradient_norm,
+        vocab_size, FLAGS.embed_size, FLAGS.size, FLAGS.num_layers, FLAGS.max_gradient_norm, FLAGS.batch_size,
         FLAGS.learning_rate, FLAGS.learning_rate_decay_factor, FLAGS.dropout,
         forward_only=forward_only, optimizer=FLAGS.optimizer)
     ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
@@ -60,11 +58,7 @@ def create_model(session, vocab_size, forward_only):
 
 def validate(model, sess, x_dev, y_dev):
     valid_costs, valid_lengths = [], []
-    for source_tokens, source_mask, target_tokens, target_mask in pair_iter(x_dev, y_dev,
-                                                                            FLAGS.batch_size,
-                                                                            FLAGS.max_seq_len,
-                                                                            FLAGS.num_wit,
-                                                                            sort_and_shuffle=False):
+    for source_tokens, source_mask, target_tokens, target_mask in pair_iter(x_dev, y_dev, FLAGS.batch_size, FLAGS.num_layers, sort_and_shuffle=False):
         cost = model.test(sess, source_tokens, source_mask, target_tokens, target_mask)
         valid_costs.append(cost * target_mask.shape[1])
         valid_lengths.append(np.sum(target_mask[1:, :]))
@@ -119,11 +113,7 @@ def train():
 
             ## Train
             epoch_tic = time.time()
-            for source_tokens, source_mask, target_tokens, target_mask in pair_iter(x_train, y_train,
-                                                                                    FLAGS.batch_size,
-                                                                                    FLAGS.max_seq_len,
-                                                                                    FLAGS.num_wit,
-                                                                                    FLAGS.num_layers):
+            for source_tokens, source_mask, target_tokens, target_mask in pair_iter(x_train, y_train, FLAGS.batch_size, FLAGS.num_layers):
                 # Get a batch and make a step.
                 tic = time.time()
 

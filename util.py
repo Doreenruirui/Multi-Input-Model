@@ -78,31 +78,32 @@ def refill(batches, fdx, fdy, batch_size, max_seq_len, max_num_wit,
 
     while linex and liney:
         x_tokens, y_tokens = tokenize_x(linex.strip()), tokenize(liney.strip())
-        x_tokens = [ele[:max_seq_len] for ele in x_tokens][:max_num_wit]
+        x_tokens = [ele[:max_seq_len] for ele in x_tokens if len(ele) > 0][:max_num_wit]
         if len(x_tokens) > 0 and len(y_tokens) < FLAGS.max_seq_len:
             line_pairs.append((x_tokens, y_tokens))
         linex, liney = fdx.readline(), fdy.readline()
 
-    if sort_and_shuffle:
-        line_pairs = sorted(line_pairs, key=lambda e: len(e[0]))
-        num_wit = [len(ele) for ele in line_pairs]
-        list_num_wit = [[] for _ in range(1, max(num_wit))]
-        num_line = len(num_wit)
-        for i in range(num_line):
-            list_num_wit[num_wit[i]].append(line_pairs[i])
-        list_num_wit = [ele for ele in list_num_wit if len(ele) > 0]
-        list_num_wit = map(lambda tokenlist:
-                           sorted(tokenlist,
-                                  key=lambda e: max([len(ele) for ele in e])),
-                           list_num_wit)
-        line_pairs = [item for l in list_num_wit for item in l]
+    if len(line_pairs) > 0:
+        if sort_and_shuffle:
+            line_pairs = sorted(line_pairs, key=lambda e: len(e[0]))
+            num_wit = [len(ele[0]) for ele in line_pairs]
+            list_num_wit = [[] for _ in range(max(num_wit) + 1)]
+            num_line = len(num_wit)
+            for i in range(num_line):
+                list_num_wit[num_wit[i]].append(line_pairs[i])
+            list_num_wit = [ele for ele in list_num_wit if len(ele) > 0]
+            list_num_wit = map(lambda cur_list:
+                               sorted(cur_list,
+                                      key=lambda token_list: max([len(ele) for ele in token_list[0]])),
+                               list_num_wit)
+            line_pairs = [item for l in list_num_wit for item in l]
 
-    for batch_start in xrange(0, len(line_pairs), batch_size):
-        x_batch, y_batch = zip(*line_pairs[batch_start:batch_start+batch_size])
-        batches.append((x_batch, y_batch))
+        for batch_start in xrange(0, len(line_pairs), batch_size):
+            x_batch, y_batch = zip(*line_pairs[batch_start:batch_start+batch_size])
+            batches.append((x_batch, y_batch))
 
-    if sort_and_shuffle:
-        random.shuffle(batches)
+        if sort_and_shuffle:
+            random.shuffle(batches)
     return
 
 
@@ -122,7 +123,7 @@ def padded_x(tokens):
                                      [PAD_ID] * (max_seq_len
                                                  - len(token_list)),
                   ele) for ele in tokens]
-    return map(lambda token_list: token_list + [PAD_ID] * (max_num_wit - len(token_list)), tokens)
+    return map(lambda token_list: token_list + [[PAD_ID] * max_seq_len]* (max_num_wit - len(token_list)), tokens)
 
 
 def initialize_vocabulary(vocabulary_path, bpe=False):
